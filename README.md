@@ -15,8 +15,8 @@ services:
     environment:
       - WYOMING_PORT=10201
       - WYOMING_HOST=0.0.0.0
+      - DEFAULT_LANGUAGE=english
       - DEFAULT_VOICE=alba
-      - MODEL_VARIANT=b6369a24
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:
@@ -38,8 +38,9 @@ You can customize the following environment variables in the compose file before
 |----------|---------|-------------|
 | `WYOMING_PORT` | `10201` | The port the Wyoming protocol server listens on. Change if you have a conflict with another service. |
 | `WYOMING_HOST` | `0.0.0.0` | The network interface to bind to. `0.0.0.0` accepts connections from any interface. |
+| `DEFAULT_LANGUAGE` | `english` | The default Pocket-TTS language/model to use when no voice language is specified. Use `french_24l` for French. |
 | `DEFAULT_VOICE` | `alba` | The default voice used when none is specified. See [Available Voices](#available-voices) for options. |
-| `MODEL_VARIANT` | `b6369a24` | The Pocket-TTS model variant to use. This corresponds to a specific model checkpoint. |
+| `MODEL_CONFIG` | unset | Optional local Pocket-TTS YAML config. Most users should leave this unset and use `DEFAULT_LANGUAGE`. |
 | `ZEROCONF` | `pocket-tts` | Service name for mDNS/Zeroconf discovery. Home Assistant uses this to auto-discover the TTS server. Set to empty string to disable. |
 
 Pull and start:
@@ -65,8 +66,8 @@ docker pull ghcr.io/ikidd/pocket-tts-wyoming:latest
 docker run -d \
   --name pocket-tts-wyoming \
   --network host \
+  -e DEFAULT_LANGUAGE=english \
   -e DEFAULT_VOICE=alba \
-  -e MODEL_VARIANT=b6369a24 \
   -e ZEROCONF=pocket-tts \
   -v pocket-tts-hf-cache:/root/.cache/huggingface \
   -v pocket-tts-cache:/root/.cache/pocket_tts \
@@ -88,7 +89,19 @@ Then update `docker-compose.yml` to use `build: .` instead of `image: ghcr.io/ik
 
 ## Available Voices
 
-alba, marius, javert, jean, fantine, cosette, eponine, azelma
+English: alba, anna, azelma, bill_boerst, caro_davy, charles, cosette, eponine, eve, fantine, george, jane, javert, jean, marius, mary, michael, paul, peter_yearsley, stuart_bell, vera
+
+French: estelle
+
+German: juergen
+
+Italian: giovanni
+
+Portuguese: rafael
+
+Spanish: lola
+
+Pocket-TTS v2 loads one language model at a time. The server loads language models lazily based on the requested voice, so the first synthesis in a non-default language can take longer while the model is downloaded and initialized.
 
 ## Home Assistant Integration
 
@@ -135,7 +148,7 @@ Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into 
 
 - **Slow startup**: First run downloads ~500MB of model weights. Use volume mounts to persist the cache.
 - **Connection issues**: Verify port 10201 is open and check logs with `docker compose logs pocket-tts-wyoming` or `docker logs pocket-tts-wyoming`
-- **Voice not found**: Ensure the voice name matches one of the 8 predefined voices listed above.
+- **Voice not found**: Ensure the voice name matches one of the predefined voices listed above.
 - **Image pull issues**: If you encounter authentication issues pulling from GHCR, ensure you're logged in: `docker login ghcr.io`
 - **Outdated image**: Pull the latest image with `docker compose pull` or `docker pull ghcr.io/ikidd/pocket-tts-wyoming:latest`
 - **First word cut off**: Run in debug mode and check the WAV files. Adjust the timing tunables as needed.

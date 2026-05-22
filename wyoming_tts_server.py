@@ -13,13 +13,24 @@ import os
 import wave
 from datetime import datetime
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import numpy
 
 from pocket_tts import TTSModel
-from pocket_tts.default_parameters import DEFAULT_VARIANT
-from pocket_tts.utils.utils import PREDEFINED_VOICES
+try:
+    from pocket_tts.default_parameters import (
+        DEFAULT_LANGUAGE as POCKET_TTS_DEFAULT_LANGUAGE,
+        get_default_voice_for_language,
+    )
+    from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
+except ImportError:
+    from pocket_tts.default_parameters import DEFAULT_VARIANT as POCKET_TTS_DEFAULT_LANGUAGE
+    from pocket_tts.utils.utils import PREDEFINED_VOICES as _ORIGINS_OF_PREDEFINED_VOICES
+
+    def get_default_voice_for_language(language: str | None) -> str:
+        return "alba"
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.error import Error
 from wyoming.event import Event
@@ -36,9 +47,69 @@ from wyoming.tts import (
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_PORT = int(os.environ.get("WYOMING_PORT", "10201"))
-DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "alba")
-MODEL_VARIANT = os.environ.get("MODEL_VARIANT", DEFAULT_VARIANT)
+DEFAULT_LANGUAGE = os.environ.get(
+    "DEFAULT_LANGUAGE",
+    os.environ.get("MODEL_LANGUAGE", POCKET_TTS_DEFAULT_LANGUAGE),
+)
+DEFAULT_VOICE = os.environ.get(
+    "DEFAULT_VOICE", get_default_voice_for_language(DEFAULT_LANGUAGE)
+)
+MODEL_CONFIG = os.environ.get("MODEL_CONFIG")
+MODEL_VARIANT = os.environ.get("MODEL_VARIANT")
 DEBUG_WAV = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
+
+LANGUAGE_ALIASES = {
+    "en": "english",
+    "en-us": "english",
+    "en-gb": "english",
+    "english": "english",
+    "english_2026-01": "english_2026-01",
+    "english_2026-04": "english_2026-04",
+    "fr": "french_24l",
+    "fr-fr": "french_24l",
+    "french": "french_24l",
+    "french_24l": "french_24l",
+    "de": "german_24l",
+    "de-de": "german_24l",
+    "german": "german_24l",
+    "german_24l": "german_24l",
+    "pt": "portuguese",
+    "pt-pt": "portuguese",
+    "pt-br": "portuguese",
+    "portuguese": "portuguese",
+    "it": "italian",
+    "it-it": "italian",
+    "italian": "italian",
+    "italian_24l": "italian_24l",
+    "es": "spanish_24l",
+    "es-es": "spanish_24l",
+    "spanish": "spanish_24l",
+    "spanish_24l": "spanish_24l",
+}
+
+LANGUAGE_CODES = {
+    "english": "en",
+    "english_2026-01": "en",
+    "english_2026-04": "en",
+    "french_24l": "fr",
+    "german_24l": "de",
+    "portuguese": "pt",
+    "italian": "it",
+    "italian_24l": "it",
+    "spanish_24l": "es",
+}
+
+VOICE_LANGUAGES = {
+    "giovanni": "italian",
+    "lola": "spanish_24l",
+    "juergen": "german_24l",
+    "rafael": "portuguese",
+    "estelle": "french_24l",
+}
+
+PREDEFINED_VOICES = dict(_ORIGINS_OF_PREDEFINED_VOICES)
+for _voice_name in PREDEFINED_VOICES:
+    VOICE_LANGUAGES.setdefault(_voice_name, "english")
 
 # Prefix trimming tunables (in seconds)
 # Minimum time before looking for the pause after the sacrificial prefix
@@ -49,7 +120,45 @@ PREFIX_MAX_DURATION = float(os.environ.get("PREFIX_MAX_DURATION", "1.0"))
 PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
 
 _VOICE_STATES: dict[str, dict] = {}
+_MODELS: dict[str, TTSModel] = {}
 _VOICE_LOCK = asyncio.Lock()
+
+
+def normalize_language(language: str | None) -> str:
+    """Normalize Home Assistant/Wyoming language values to Pocket-TTS model names."""
+    if not language:
+        return normalize_language(DEFAULT_LANGUAGE)
+
+    normalized = language.lower().replace("_", "-")
+    return LANGUAGE_ALIASES.get(normalized, LANGUAGE_ALIASES.get(language.lower(), language))
+
+
+def is_language_name(value: str) -> bool:
+    normalized = value.lower().replace("_", "-")
+    return normalized in LANGUAGE_ALIASES or value.lower() in LANGUAGE_ALIASES
+
+
+def get_voice_language(voice_name: str) -> str:
+    return normalize_language(VOICE_LANGUAGES.get(voice_name, DEFAULT_LANGUAGE))
+
+
+def default_voice_for_language(language: str | None) -> str:
+    normalized_language = normalize_language(language)
+    return get_default_voice_for_language(normalized_language.replace("_24l", ""))
+
+
+def load_tts_model(language: str) -> TTSModel:
+    config = MODEL_CONFIG
+    if not config and MODEL_VARIANT and Path(MODEL_VARIANT).suffix in (".yaml", ".yml"):
+        config = MODEL_VARIANT
+
+    if config:
+        return TTSModel.load_model(config=config)
+
+    try:
+        return TTSModel.load_model(language=language)
+    except TypeError:
+        return TTSModel.load_model(config=MODEL_VARIANT or language)
 
 
 class PocketTTSEventHandler(AsyncEventHandler):
@@ -59,7 +168,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
         self,
         wyoming_info: Info,
         cli_args: argparse.Namespace,
-        tts_model: TTSModel,
         *args,
         **kwargs,
     ) -> None:
@@ -67,7 +175,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
-        self.tts_model = tts_model
         self.is_streaming: Optional[bool] = None
         self._synthesize: Optional[Synthesize] = None
         self._stream_text: str = ""
@@ -149,9 +256,11 @@ class PocketTTSEventHandler(AsyncEventHandler):
         text = "... " + text
         
         voice_name: Optional[str] = None
+        requested_language: Optional[str] = None
 
         if synthesize.voice is not None:
             voice_name = synthesize.voice.name
+            requested_language = synthesize.voice.language
 
         if voice_name is None:
             voice_name = self.cli_args.voice
@@ -160,6 +269,10 @@ class PocketTTSEventHandler(AsyncEventHandler):
         if voice_name and voice_name.startswith("pocket-tts-"):
             voice_name = voice_name.replace("pocket-tts-", "", 1)
 
+        if voice_name and is_language_name(voice_name):
+            requested_language = voice_name
+            voice_name = default_voice_for_language(requested_language)
+
         if voice_name not in PREDEFINED_VOICES:
             _LOGGER.warning(
                 "Voice '%s' not found, using default '%s'", voice_name, self.cli_args.voice
@@ -167,13 +280,25 @@ class PocketTTSEventHandler(AsyncEventHandler):
             voice_name = self.cli_args.voice
 
         assert voice_name is not None
+        language = normalize_language(requested_language or get_voice_language(voice_name))
 
         async with _VOICE_LOCK:
             global _VOICE_STATES
-            if voice_name not in _VOICE_STATES:
-                _LOGGER.info("Loading voice state for: %s", voice_name)
+            global _MODELS
+
+            if language not in _MODELS:
+                _LOGGER.info("Loading Pocket-TTS model (language: %s)...", language)
+                _MODELS[language] = load_tts_model(language)
+                _LOGGER.info("Model loaded successfully for language: %s", language)
+                _LOGGER.info("Sample rate: %d Hz", _MODELS[language].sample_rate)
+
+            tts_model = _MODELS[language]
+            voice_state_key = f"{language}:{voice_name}"
+
+            if voice_state_key not in _VOICE_STATES:
+                _LOGGER.info("Loading voice state for: %s (%s)", voice_name, language)
                 try:
-                    _VOICE_STATES[voice_name] = self.tts_model.get_state_for_audio_prompt(
+                    _VOICE_STATES[voice_state_key] = tts_model.get_state_for_audio_prompt(
                         voice_name
                     )
                 except Exception as e:
@@ -186,14 +311,17 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     )
                     return True
 
-            voice_state = _VOICE_STATES[voice_name]
+            voice_state = _VOICE_STATES[voice_state_key]
 
             try:
                 _LOGGER.info(
-                    "Synthesizing text (voice: %s, length: %d chars)", voice_name, len(text)
+                    "Synthesizing text (voice: %s, language: %s, length: %d chars)",
+                    voice_name,
+                    language,
+                    len(text),
                 )
 
-                sample_rate = self.tts_model.sample_rate
+                sample_rate = tts_model.sample_rate
                 width = 2
                 channels = 1
                 bytes_per_sample = width * channels
@@ -209,7 +337,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                         ).event(),
                     )
 
-                audio_chunks = self.tts_model.generate_audio_stream(
+                audio_chunks = tts_model.generate_audio_stream(
                     model_state=voice_state, text_to_generate=text, copy_state=True
                 )
 
@@ -324,6 +452,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
 async def main() -> None:
     """Main entry point."""
+    global MODEL_CONFIG, MODEL_VARIANT
+
     parser = argparse.ArgumentParser(
         description="Wyoming Protocol TTS Server for Pocket-TTS"
     )
@@ -344,9 +474,19 @@ async def main() -> None:
         help=f"Default voice to use (default: {DEFAULT_VOICE})",
     )
     parser.add_argument(
+        "--language",
+        default=DEFAULT_LANGUAGE,
+        help=f"Default language/model to use (default: {DEFAULT_LANGUAGE})",
+    )
+    parser.add_argument(
         "--variant",
         default=MODEL_VARIANT,
-        help=f"Model variant (default: {MODEL_VARIANT})",
+        help="Deprecated. Use --language for Pocket-TTS v2, or --config for a local YAML model config.",
+    )
+    parser.add_argument(
+        "--config",
+        default=MODEL_CONFIG,
+        help="Local Pocket-TTS YAML model config. Overrides --language.",
     )
     parser.add_argument(
         "--uri",
@@ -381,6 +521,9 @@ async def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if "DEFAULT_VOICE" not in os.environ and args.voice == DEFAULT_VOICE:
+        args.voice = default_voice_for_language(args.language)
     
     # Override debug_wav from environment if not explicitly set via command line
     # Check environment variable at runtime (not just at module load)
@@ -394,35 +537,28 @@ async def main() -> None:
         _LOGGER.info("Debug WAV mode enabled - WAV files will be written to /output/ on every response")
     _LOGGER.debug(args)
 
-    os.environ["MODEL_VARIANT"] = args.variant
-    variant = os.environ.get("MODEL_VARIANT", MODEL_VARIANT)
-    _LOGGER.info("Loading Pocket-TTS model (variant: %s)...", variant)
-    tts_model = TTSModel.load_model(config=variant)
-    _LOGGER.info("Model loaded successfully")
-    _LOGGER.info("Sample rate: %d Hz", tts_model.sample_rate)
+    if args.config:
+        MODEL_CONFIG = args.config
+        os.environ["MODEL_CONFIG"] = args.config
+    if args.variant:
+        MODEL_VARIANT = args.variant
+        os.environ["MODEL_VARIANT"] = args.variant
 
-    _LOGGER.info("Pre-loading voice states for %d voices...", len(PREDEFINED_VOICES))
-    for voice_name in PREDEFINED_VOICES:
-        try:
-            voice_state = tts_model.get_state_for_audio_prompt(voice_name)
-            global _VOICE_STATES
-            _VOICE_STATES[voice_name] = voice_state
-            _LOGGER.info("Loaded voice state for: %s", voice_name)
-        except Exception as e:
-            _LOGGER.warning("Failed to load voice state for %s: %s", voice_name, e)
-    _LOGGER.info("Voice states pre-loaded")
+    default_language = normalize_language(args.language)
+    _LOGGER.info("Default language: %s", default_language)
+    _LOGGER.info("Default voice: %s", args.voice)
 
     voices = [
         TtsVoice(
             name=voice_name,
-            description=f"Pocket-TTS voice: {voice_name}",
+            description=f"Pocket-TTS voice: {voice_name} ({get_voice_language(voice_name)})",
             attribution=Attribution(
                 name="Kyutai Pocket-TTS",
                 url="https://github.com/kyutai-labs/pocket-tts",
             ),
             installed=True,
             version=None,
-            languages=["en"],
+            languages=[LANGUAGE_CODES.get(get_voice_language(voice_name), get_voice_language(voice_name))],
             speakers=None,
         )
         for voice_name in PREDEFINED_VOICES
@@ -439,7 +575,7 @@ async def main() -> None:
                 ),
                 installed=True,
                 voices=sorted(voices, key=lambda v: v.name),
-                version="1.0.1",
+                version=None,
                 supports_synthesize_streaming=True,
             )
         ],
@@ -488,7 +624,6 @@ async def main() -> None:
             PocketTTSEventHandler,
             wyoming_info,
             args,
-            tts_model,
         )
     )
 

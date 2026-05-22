@@ -6,8 +6,8 @@ services:
     environment:
       - WYOMING_PORT=10201
       - WYOMING_HOST=0.0.0.0
+      - DEFAULT_LANGUAGE=english
       - DEFAULT_VOICE=alba
-      - MODEL_VARIANT=b6369a24
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:
