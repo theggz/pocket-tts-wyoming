@@ -17,11 +17,13 @@ services:
       - WYOMING_HOST=0.0.0.0
       - DEFAULT_LANGUAGE=english
       - DEFAULT_VOICE=alba
+      - VOICES_DIR=/voices
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:
       - pocket-tts-hf-cache:/root/.cache/huggingface
       - pocket-tts-cache:/root/.cache/pocket_tts
+      - ./voices:/voices
 
 volumes:
   pocket-tts-hf-cache:
@@ -41,6 +43,7 @@ You can customize the following environment variables in the compose file before
 | `DEFAULT_LANGUAGE` | `english` | The default Pocket-TTS language/model to use when no voice language is specified. Use `french_24l` for French. |
 | `DEFAULT_VOICE` | `alba` | The default voice used when none is specified. See [Available Voices](#available-voices) for options. |
 | `MODEL_CONFIG` | unset | Optional local Pocket-TTS YAML config. Most users should leave this unset and use `DEFAULT_LANGUAGE`. |
+| `VOICES_DIR` | `/voices` | Directory scanned for custom `.safetensors` voice states. |
 | `ZEROCONF` | `pocket-tts` | Service name for mDNS/Zeroconf discovery. Home Assistant uses this to auto-discover the TTS server. Set to empty string to disable. |
 
 Pull and start:
@@ -68,9 +71,11 @@ docker run -d \
   --network host \
   -e DEFAULT_LANGUAGE=english \
   -e DEFAULT_VOICE=alba \
+  -e VOICES_DIR=/voices \
   -e ZEROCONF=pocket-tts \
   -v pocket-tts-hf-cache:/root/.cache/huggingface \
   -v pocket-tts-cache:/root/.cache/pocket_tts \
+  -v ./voices:/voices \
   ghcr.io/ikidd/pocket-tts-wyoming:latest
 ```
 
@@ -102,6 +107,20 @@ Portuguese: rafael
 Spanish: lola
 
 Pocket-TTS v2 loads one language model at a time. The server loads language models lazily based on the requested voice, so the first synthesis in a non-default language can take longer while the model is downloaded and initialized.
+
+## Custom Voices
+
+Custom Pocket-TTS voice states can be added by placing `.safetensors` files in
+the `voices` directory mounted as `/voices` in the container. A file named
+`voices/my_voice.safetensors` appears in Home Assistant as `my_voice`.
+
+Custom voices use `DEFAULT_LANGUAGE` by default. To assign a custom voice to a
+specific Pocket-TTS language/model, place it in a language subdirectory, for
+example `voices/french_24l/ma_voix.safetensors`.
+
+The server scans the voices directory when Home Assistant asks for Wyoming info
+and before each synthesis request. If Home Assistant has already cached the
+voice list, reload the Wyoming integration after adding a new file.
 
 ## Home Assistant Integration
 
@@ -145,10 +164,13 @@ Prefix trimming is streaming-aware: the server buffers only the beginning of the
 | `PREFIX_MIN_DURATION` | `0.15` | Minimum seconds before looking for the pause after the prefix |
 | `PREFIX_MAX_DURATION` | `1.0` | Maximum seconds to search for the prefix end |
 | `PREFIX_SILENCE_GAP` | `0.08` | Minimum silence duration (seconds) to identify the gap after the prefix |
+| `PREFIX_KEEP_BEFORE` | `0.08` | Seconds of audio kept before the detected prefix end to avoid cutting the first syllable |
+| `END_PADDING` | `0.12` | Seconds of silence appended before `AudioStop` to avoid client-side clipping |
 
 **Tuning tips:**
 - If you hear part of the "..." prefix, decrease `PREFIX_SILENCE_GAP` to catch shorter pauses
-- If the first syllable is still being cut, increase `PREFIX_MIN_DURATION`
+- If the first syllable is still being cut, increase `PREFIX_KEEP_BEFORE` first, then `PREFIX_MIN_DURATION`
+- If the end of the sentence is cut, increase `END_PADDING`
 - Different voices speak at different speeds, so optimal values may vary
 
 ## Troubleshooting

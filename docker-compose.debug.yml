@@ -10,5 +10,9 @@ services:
       - PREFIX_MAX_DURATION=1.0
       # Minimum silence duration to consider it the gap after the prefix
       - PREFIX_SILENCE_GAP=0.08
+      # Audio kept before the detected prefix end to avoid cutting the first syllable
+      - PREFIX_KEEP_BEFORE=0.08
+      # Silence appended before AudioStop to avoid client-side clipping
+      - END_PADDING=0.12
     volumes:
       - .:/output

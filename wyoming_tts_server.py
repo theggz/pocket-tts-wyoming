@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import wave
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -86,6 +87,7 @@ DEFAULT_VOICE = os.environ.get(
 MODEL_CONFIG = os.environ.get("MODEL_CONFIG")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT")
 DEBUG_WAV = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
+VOICES_DIR = os.environ.get("VOICES_DIR", "/voices")
 
 LANGUAGE_ALIASES = {
     "en": "english",
@@ -140,6 +142,17 @@ PREDEFINED_VOICES = dict(_ORIGINS_OF_PREDEFINED_VOICES)
 for _voice_name in PREDEFINED_VOICES:
     VOICE_LANGUAGES.setdefault(_voice_name, "english")
 
+
+@dataclass(frozen=True)
+class CustomVoice:
+    name: str
+    path: Path
+    language: str
+    mtime: float
+
+
+CUSTOM_VOICES: dict[str, CustomVoice] = {}
+
 # Prefix trimming tunables (in seconds)
 # Minimum time before looking for the pause after the sacrificial prefix
 PREFIX_MIN_DURATION = float(os.environ.get("PREFIX_MIN_DURATION", "0.15"))
@@ -147,6 +160,10 @@ PREFIX_MIN_DURATION = float(os.environ.get("PREFIX_MIN_DURATION", "0.15"))
 PREFIX_MAX_DURATION = float(os.environ.get("PREFIX_MAX_DURATION", "1.0"))
 # Minimum silence duration to consider it the gap after the prefix
 PREFIX_SILENCE_GAP = float(os.environ.get("PREFIX_SILENCE_GAP", "0.08"))
+# Audio kept before the detected prefix end to avoid cutting the first syllable
+PREFIX_KEEP_BEFORE = float(os.environ.get("PREFIX_KEEP_BEFORE", "0.08"))
+# Silence appended before AudioStop so clients do not clip the last samples
+END_PADDING = float(os.environ.get("END_PADDING", "0.12"))
 
 _VOICE_STATES: dict[str, dict] = {}
 _MODELS: dict[str, TTSModel] = {}
@@ -168,6 +185,9 @@ def is_language_name(value: str) -> bool:
 
 
 def get_voice_language(voice_name: str) -> str:
+    if voice_name in CUSTOM_VOICES:
+        return normalize_language(CUSTOM_VOICES[voice_name].language)
+
     return normalize_language(VOICE_LANGUAGES.get(voice_name, DEFAULT_LANGUAGE))
 
 
@@ -188,6 +208,109 @@ def load_tts_model(language: str) -> TTSModel:
         return TTSModel.load_model(language=language)
     except TypeError:
         return TTSModel.load_model(config=MODEL_VARIANT or language)
+
+
+def scan_custom_voices(voices_dir: str | Path, default_language: str) -> None:
+    """Discover custom safetensors voices from the configured voices directory."""
+    global CUSTOM_VOICES
+
+    voices_path = Path(voices_dir)
+    discovered: dict[str, CustomVoice] = {}
+    if voices_path.is_dir():
+        for voice_path in sorted(voices_path.rglob("*.safetensors")):
+            if not voice_path.is_file():
+                continue
+
+            voice_name = voice_path.stem
+            parent_language = voice_path.parent.name
+            language = parent_language if is_language_name(parent_language) else default_language
+            language = normalize_language(language)
+
+            if voice_name in PREDEFINED_VOICES:
+                _LOGGER.warning(
+                    "Ignoring custom voice '%s' from %s because it conflicts with a built-in voice",
+                    voice_name,
+                    voice_path,
+                )
+                continue
+
+            if voice_name in discovered:
+                _LOGGER.warning(
+                    "Ignoring duplicate custom voice '%s' from %s; first match was %s",
+                    voice_name,
+                    voice_path,
+                    discovered[voice_name].path,
+                )
+                continue
+
+            try:
+                mtime = voice_path.stat().st_mtime
+            except OSError as err:
+                _LOGGER.warning("Unable to inspect custom voice %s: %s", voice_path, err)
+                continue
+
+            discovered[voice_name] = CustomVoice(
+                name=voice_name,
+                path=voice_path,
+                language=language,
+                mtime=mtime,
+            )
+
+    stale_keys = []
+    for name, voice in CUSTOM_VOICES.items():
+        updated = discovered.get(name)
+        if updated is None or updated.path != voice.path or updated.mtime != voice.mtime:
+            stale_keys.append(f"{voice.language}:{name}")
+
+    CUSTOM_VOICES = discovered
+    for key in stale_keys:
+        _VOICE_STATES.pop(key, None)
+
+
+def get_voice_prompt(voice_name: str) -> str:
+    if voice_name in CUSTOM_VOICES:
+        return str(CUSTOM_VOICES[voice_name].path)
+
+    return voice_name
+
+
+def get_available_voice_names() -> list[str]:
+    return sorted([*PREDEFINED_VOICES.keys(), *CUSTOM_VOICES.keys()])
+
+
+def build_wyoming_info() -> Info:
+    voices = [
+        TtsVoice(
+            name=voice_name,
+            description=f"Pocket-TTS voice: {voice_name} ({get_voice_language(voice_name)})",
+            attribution=Attribution(
+                name="Kyutai Pocket-TTS",
+                url="https://github.com/kyutai-labs/pocket-tts",
+            ),
+            installed=True,
+            version=None,
+            languages=[LANGUAGE_CODES.get(get_voice_language(voice_name), get_voice_language(voice_name))],
+            speakers=None,
+        )
+        for voice_name in get_available_voice_names()
+    ]
+
+    return Info(
+        tts=[
+            TtsProgram(
+                name="pocket-tts",
+                description="A fast, local, neural text to speech engine",
+                attribution=Attribution(
+                    name="Kyutai Pocket-TTS",
+                    url="https://github.com/kyutai-labs/pocket-tts",
+                ),
+                installed=True,
+                voices=voices,
+                version=None,
+                supports_synthesize_streaming=True,
+            )
+        ],
+    )
 
 
 def find_prefix_end(
@@ -226,7 +349,6 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
     def __init__(
         self,
-        wyoming_info: Info,
         cli_args: argparse.Namespace,
         *args,
         **kwargs,
@@ -234,15 +356,16 @@ class PocketTTSEventHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
 
         self.cli_args = cli_args
-        self.wyoming_info_event = wyoming_info.event()
         self.is_streaming: Optional[bool] = None
+        self.audio_started = False
         self.sbd = SentenceBoundaryDetector()
         self._synthesize: Optional[Synthesize] = None
 
     async def handle_event(self, event: Event) -> bool:
         """Handle incoming Wyoming protocol events."""
         if Describe.is_type(event.type):
-            await self.write_event(self.wyoming_info_event)
+            scan_custom_voices(self.cli_args.voices_dir, self.cli_args.language)
+            await self.write_event(build_wyoming_info().event())
             _LOGGER.debug("Sent info")
             return True
 
@@ -281,6 +404,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
             if SynthesizeStart.is_type(event.type):
                 stream_start = SynthesizeStart.from_event(event)
                 self.is_streaming = True
+                self.audio_started = False
                 self.sbd = SentenceBoundaryDetector()
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 _LOGGER.debug("Text stream started: voice=%s", stream_start.voice)
@@ -293,7 +417,12 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 for sentence in self.sbd.add_chunk(stream_chunk.text):
                     _LOGGER.debug("Synthesizing stream sentence: %s", sentence)
                     self._synthesize.text = sentence
-                    await self._handle_synthesize(self._synthesize)
+                    await self._handle_synthesize(
+                        self._synthesize,
+                        send_start=(not self.audio_started),
+                        send_stop=False,
+                    )
+                    self.audio_started = True
 
                 return True
 
@@ -301,10 +430,18 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 assert self._synthesize is not None
                 self._synthesize.text = self.sbd.finish()
                 if self._synthesize.text:
-                    await self._handle_synthesize(self._synthesize)
+                    await self._handle_synthesize(
+                        self._synthesize,
+                        send_start=(not self.audio_started),
+                        send_stop=True,
+                    )
+                    self.audio_started = True
+                elif self.audio_started:
+                    await self.write_event(AudioStop().event())
 
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
+                self.audio_started = False
                 _LOGGER.debug("Text stream stopped")
                 return True
 
@@ -354,7 +491,9 @@ class PocketTTSEventHandler(AsyncEventHandler):
             requested_language = voice_name
             voice_name = default_voice_for_language(requested_language)
 
-        if voice_name not in PREDEFINED_VOICES:
+        scan_custom_voices(self.cli_args.voices_dir, self.cli_args.language)
+
+        if voice_name not in PREDEFINED_VOICES and voice_name not in CUSTOM_VOICES:
             _LOGGER.warning(
                 "Voice '%s' not found, using default '%s'", voice_name, self.cli_args.voice
             )
@@ -380,7 +519,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 _LOGGER.info("Loading voice state for: %s (%s)", voice_name, language)
                 try:
                     _VOICE_STATES[voice_state_key] = tts_model.get_state_for_audio_prompt(
-                        voice_name
+                        get_voice_prompt(voice_name)
                     )
                 except Exception as e:
                     _LOGGER.error("Failed to load voice state for %s: %s", voice_name, e)
@@ -483,7 +622,9 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
                 prefix_buffer = numpy.array([], dtype="float32")
                 max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
+                prefix_keep_samples = int(sample_rate * PREFIX_KEEP_BEFORE)
                 padding_samples = int(sample_rate * 0.05)
+                end_padding_samples = int(sample_rate * END_PADDING)
                 prefix_trimmed = False
                 leading_trimmed = False
                 threshold = 0.0
@@ -533,7 +674,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
                             prefix_end / sample_rate,
                         )
                         prefix_trimmed = True
-                        await emit_after_leading_trim(prefix_buffer[prefix_end:])
+                        trim_start = max(0, prefix_end - prefix_keep_samples)
+                        await emit_after_leading_trim(prefix_buffer[trim_start:])
                         prefix_buffer = numpy.array([], dtype="float32")
                         continue
 
@@ -565,7 +707,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
                             prefix_end,
                             prefix_end / sample_rate,
                         )
-                        await emit_after_leading_trim(prefix_buffer[prefix_end:])
+                        trim_start = max(0, prefix_end - prefix_keep_samples)
+                        await emit_after_leading_trim(prefix_buffer[trim_start:])
                     else:
                         _LOGGER.warning(
                             "Could not detect prefix silence; emitting buffered audio without prefix trim"
@@ -573,6 +716,10 @@ class PocketTTSEventHandler(AsyncEventHandler):
                         await emit_after_leading_trim(prefix_buffer)
 
                 await flush_audio()
+
+                if send_stop and end_padding_samples > 0:
+                    await emit_audio(numpy.zeros(end_padding_samples, dtype="float32"))
+                    await flush_audio()
 
                 # Write debug WAV file if enabled
                 if self.cli_args.debug_wav:
@@ -649,6 +796,11 @@ async def main() -> None:
         help="Local Pocket-TTS YAML model config. Overrides --language.",
     )
     parser.add_argument(
+        "--voices-dir",
+        default=VOICES_DIR,
+        help=f"Directory containing custom .safetensors voices (default: {VOICES_DIR})",
+    )
+    parser.add_argument(
         "--uri",
         default=None,
         help="Server URI (e.g., tcp://0.0.0.0:10201). If not provided, constructed from --host and --port",
@@ -705,41 +857,10 @@ async def main() -> None:
         os.environ["MODEL_VARIANT"] = args.variant
 
     default_language = normalize_language(args.language)
+    scan_custom_voices(args.voices_dir, default_language)
     _LOGGER.info("Default language: %s", default_language)
     _LOGGER.info("Default voice: %s", args.voice)
-
-    voices = [
-        TtsVoice(
-            name=voice_name,
-            description=f"Pocket-TTS voice: {voice_name} ({get_voice_language(voice_name)})",
-            attribution=Attribution(
-                name="Kyutai Pocket-TTS",
-                url="https://github.com/kyutai-labs/pocket-tts",
-            ),
-            installed=True,
-            version=None,
-            languages=[LANGUAGE_CODES.get(get_voice_language(voice_name), get_voice_language(voice_name))],
-            speakers=None,
-        )
-        for voice_name in PREDEFINED_VOICES
-    ]
-
-    wyoming_info = Info(
-        tts=[
-            TtsProgram(
-                name="pocket-tts",
-                description="A fast, local, neural text to speech engine",
-                attribution=Attribution(
-                    name="Kyutai Pocket-TTS",
-                    url="https://github.com/kyutai-labs/pocket-tts",
-                ),
-                installed=True,
-                voices=sorted(voices, key=lambda v: v.name),
-                version=None,
-                supports_synthesize_streaming=True,
-            )
-        ],
-    )
+    _LOGGER.info("Custom voices directory: %s", args.voices_dir)
 
     if args.uri is None:
         args.uri = f"tcp://{args.host}:{args.port}"
@@ -778,11 +899,10 @@ async def main() -> None:
                      zeroconf_name, tcp_server.port, zeroconf_host)
 
     _LOGGER.info("Ready")
-    _LOGGER.info("Available voices: %s", ", ".join(PREDEFINED_VOICES.keys()))
+    _LOGGER.info("Available voices: %s", ", ".join(get_available_voice_names()))
     await server.run(
         partial(
             PocketTTSEventHandler,
-            wyoming_info,
             args,
         )
     )
