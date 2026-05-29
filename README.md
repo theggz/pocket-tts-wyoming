@@ -106,6 +106,11 @@ Pocket-TTS v2 loads one language model at a time. The server loads language mode
 ## Home Assistant Integration
 
 The server supports Zeroconf/mDNS for automatic discovery.
+Audio is streamed over the Wyoming protocol as Pocket-TTS produces chunks. When
+clients stream text with `synthesize-start`/`synthesize-chunk`, complete
+sentences are synthesized as soon as they are detected instead of waiting for
+`synthesize-stop`. A small startup buffer is kept only long enough to detect and
+trim the sacrificial prefix.
 
 1. Start the Docker container
 2. Go to Settings -> Devices & Services -> Add Integration
@@ -130,6 +135,8 @@ This enables:
 ### Background
 
 Audio-prompt based TTS models like Pocket-TTS can "swallow" the first word into a blend region when transitioning from the voice prompt. To prevent this, a sacrificial prefix (`"..."`) is prepended to all text and then trimmed from the resulting audio. Debug mode lets you tune this trimming.
+
+Prefix trimming is streaming-aware: the server buffers only the beginning of the response until it finds the silence gap after the prefix, then immediately emits subsequent audio chunks. `PREFIX_MAX_DURATION` is therefore also the maximum amount of audio buffered before the server falls back to streaming without prefix trimming.
 
 ### Timing Tunables
 

@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 import wave
 from datetime import datetime
 from functools import partial
@@ -19,6 +20,34 @@ from typing import Optional
 import numpy
 
 from pocket_tts import TTSModel
+try:
+    from sentence_stream import SentenceBoundaryDetector
+except ImportError:
+    class SentenceBoundaryDetector:
+        """Small fallback used when sentence-stream is not installed locally."""
+
+        def __init__(self) -> None:
+            self._buffer = ""
+
+        def add_chunk(self, text: str):
+            self._buffer += text
+            sentences = []
+            start = 0
+            for index, char in enumerate(self._buffer):
+                if char in ".!?":
+                    sentence = self._buffer[start : index + 1].strip()
+                    if sentence:
+                        sentences.append(sentence)
+                    start = index + 1
+
+            self._buffer = self._buffer[start:]
+            return sentences
+
+        def finish(self) -> str:
+            text = self._buffer.strip()
+            self._buffer = ""
+            return text
+
 try:
     from pocket_tts.default_parameters import (
         DEFAULT_LANGUAGE as POCKET_TTS_DEFAULT_LANGUAGE,
@@ -161,6 +190,37 @@ def load_tts_model(language: str) -> TTSModel:
         return TTSModel.load_model(config=MODEL_VARIANT or language)
 
 
+def find_prefix_end(
+    audio: numpy.ndarray,
+    sample_rate: int,
+    threshold: float,
+) -> int:
+    """Find the silence gap after the sacrificial prefix."""
+    min_prefix_samples = int(sample_rate * PREFIX_MIN_DURATION)
+    max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
+    min_silence_samples = int(sample_rate * PREFIX_SILENCE_GAP)
+
+    if len(audio) <= min_prefix_samples:
+        return 0
+
+    search_end = min(len(audio), max_prefix_samples)
+    is_silent = numpy.abs(audio[:search_end]) < threshold
+
+    i = min_prefix_samples
+    while i < search_end:
+        if is_silent[i]:
+            silence_start = i
+            while i < search_end and is_silent[i]:
+                i += 1
+
+            if (i - silence_start) >= min_silence_samples:
+                return i
+        else:
+            i += 1
+
+    return 0
+
+
 class PocketTTSEventHandler(AsyncEventHandler):
     """Event handler for Pocket-TTS Wyoming server."""
 
@@ -176,8 +236,8 @@ class PocketTTSEventHandler(AsyncEventHandler):
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
         self.is_streaming: Optional[bool] = None
+        self.sbd = SentenceBoundaryDetector()
         self._synthesize: Optional[Synthesize] = None
-        self._stream_text: str = ""
 
     async def handle_event(self, event: Event) -> bool:
         """Handle incoming Wyoming protocol events."""
@@ -195,13 +255,33 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     return True
 
                 synthesize = Synthesize.from_event(event)
-                await self._handle_synthesize(synthesize, send_start=True, send_stop=True)
+                self._synthesize = Synthesize(text="", voice=synthesize.voice)
+                self.sbd = SentenceBoundaryDetector()
+                start_sent = False
+
+                for i, sentence in enumerate(self.sbd.add_chunk(synthesize.text)):
+                    self._synthesize.text = sentence
+                    await self._handle_synthesize(
+                        self._synthesize, send_start=(i == 0), send_stop=False
+                    )
+                    start_sent = True
+
+                self._synthesize.text = self.sbd.finish()
+                if self._synthesize.text:
+                    await self._handle_synthesize(
+                        self._synthesize,
+                        send_start=(not start_sent),
+                        send_stop=True,
+                    )
+                else:
+                    await self.write_event(AudioStop().event())
+
                 return True
 
             if SynthesizeStart.is_type(event.type):
                 stream_start = SynthesizeStart.from_event(event)
                 self.is_streaming = True
-                self._stream_text = ""
+                self.sbd = SentenceBoundaryDetector()
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 _LOGGER.debug("Text stream started: voice=%s", stream_start.voice)
                 return True
@@ -209,21 +289,22 @@ class PocketTTSEventHandler(AsyncEventHandler):
             if SynthesizeChunk.is_type(event.type):
                 assert self._synthesize is not None
                 stream_chunk = SynthesizeChunk.from_event(event)
-                self._stream_text += stream_chunk.text
                 _LOGGER.debug("Received stream chunk: %s", stream_chunk.text[:50])
+                for sentence in self.sbd.add_chunk(stream_chunk.text):
+                    _LOGGER.debug("Synthesizing stream sentence: %s", sentence)
+                    self._synthesize.text = sentence
+                    await self._handle_synthesize(self._synthesize)
+
                 return True
 
             if SynthesizeStop.is_type(event.type):
                 assert self._synthesize is not None
-                if self._stream_text.strip():
-                    self._synthesize.text = self._stream_text.strip()
-                    await self._handle_synthesize(
-                        self._synthesize, send_start=True, send_stop=True
-                    )
+                self._synthesize.text = self.sbd.finish()
+                if self._synthesize.text:
+                    await self._handle_synthesize(self._synthesize)
 
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
-                self._stream_text = ""
                 _LOGGER.debug("Text stream stopped")
                 return True
 
@@ -341,100 +422,179 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     model_state=voice_state, text_to_generate=text, copy_state=True
                 )
 
-                all_audio_arrays = []
+                debug_audio_arrays = []
+                pending_bytes = b""
+                synthesis_started_at = time.monotonic()
+                first_audio_sent = False
+
+                async def emit_audio(audio_array: numpy.ndarray) -> None:
+                    nonlocal first_audio_sent, pending_bytes
+
+                    if audio_array.size == 0:
+                        return
+
+                    if self.cli_args.debug_wav:
+                        debug_audio_arrays.append(audio_array.copy())
+
+                    audio_bytes = (
+                        audio_array.clip(-1.0, 1.0) * 32767
+                    ).astype("int16").tobytes()
+                    pending_bytes += audio_bytes
+
+                    emit_len = (len(pending_bytes) // bytes_per_chunk) * bytes_per_chunk
+                    if emit_len == 0:
+                        return
+
+                    bytes_to_emit = pending_bytes[:emit_len]
+                    pending_bytes = pending_bytes[emit_len:]
+
+                    for offset in range(0, len(bytes_to_emit), bytes_per_chunk):
+                        chunk = bytes_to_emit[offset : offset + bytes_per_chunk]
+                        if not first_audio_sent:
+                            first_audio_sent = True
+                            _LOGGER.info(
+                                "Starting audio stream after %d ms",
+                                int((time.monotonic() - synthesis_started_at) * 1000),
+                            )
+                        await self.write_event(
+                            AudioChunk(
+                                audio=chunk,
+                                rate=sample_rate,
+                                width=width,
+                                channels=channels,
+                            ).event(),
+                        )
+
+                async def flush_audio() -> None:
+                    nonlocal pending_bytes
+
+                    if not pending_bytes:
+                        return
+
+                    await self.write_event(
+                        AudioChunk(
+                            audio=pending_bytes,
+                            rate=sample_rate,
+                            width=width,
+                            channels=channels,
+                        ).event(),
+                    )
+                    pending_bytes = b""
+
+                prefix_buffer = numpy.array([], dtype="float32")
+                max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
+                padding_samples = int(sample_rate * 0.05)
+                prefix_trimmed = False
+                leading_trimmed = False
+                threshold = 0.0
+
+                async def emit_after_leading_trim(audio_array: numpy.ndarray) -> None:
+                    nonlocal leading_trimmed
+
+                    if audio_array.size == 0:
+                        return
+
+                    if leading_trimmed:
+                        await emit_audio(audio_array)
+                        return
+
+                    non_silent_indices = numpy.where(
+                        numpy.abs(audio_array) > threshold
+                    )[0]
+                    if len(non_silent_indices) == 0:
+                        return
+
+                    first_non_silent = max(0, non_silent_indices[0] - padding_samples)
+                    leading_trimmed = True
+                    await emit_audio(audio_array[first_non_silent:])
+
+                audio_generated = False
                 for audio_chunk in audio_chunks:
                     audio_array = audio_chunk.detach().cpu().numpy()
-                    all_audio_arrays.append(audio_array)
+                    audio_generated = True
 
-                if not all_audio_arrays:
+                    if prefix_trimmed:
+                        await emit_after_leading_trim(audio_array)
+                        continue
+
+                    prefix_buffer = numpy.concatenate((prefix_buffer, audio_array))
+                    max_amplitude = numpy.abs(prefix_buffer).max()
+                    threshold = max(max_amplitude * 0.01, 1e-5)
+                    prefix_end = find_prefix_end(
+                        prefix_buffer,
+                        sample_rate=sample_rate,
+                        threshold=threshold,
+                    )
+
+                    if prefix_end > 0:
+                        _LOGGER.debug(
+                            "Trimming prefix: %d samples (%.3fs)",
+                            prefix_end,
+                            prefix_end / sample_rate,
+                        )
+                        prefix_trimmed = True
+                        await emit_after_leading_trim(prefix_buffer[prefix_end:])
+                        prefix_buffer = numpy.array([], dtype="float32")
+                        continue
+
+                    if len(prefix_buffer) >= max_prefix_samples:
+                        _LOGGER.warning(
+                            "Could not detect prefix silence after %.3fs; streaming audio without prefix trim",
+                            PREFIX_MAX_DURATION,
+                        )
+                        prefix_trimmed = True
+                        await emit_after_leading_trim(prefix_buffer)
+                        prefix_buffer = numpy.array([], dtype="float32")
+
+                if not audio_generated:
                     if send_stop:
                         await self.write_event(AudioStop().event())
                     return True
 
-                full_audio = numpy.concatenate(all_audio_arrays)
+                if not prefix_trimmed and prefix_buffer.size > 0:
+                    max_amplitude = numpy.abs(prefix_buffer).max()
+                    threshold = max(max_amplitude * 0.01, 1e-5)
+                    prefix_end = find_prefix_end(
+                        prefix_buffer,
+                        sample_rate=sample_rate,
+                        threshold=threshold,
+                    )
+                    if prefix_end > 0:
+                        _LOGGER.debug(
+                            "Trimming prefix: %d samples (%.3fs)",
+                            prefix_end,
+                            prefix_end / sample_rate,
+                        )
+                        await emit_after_leading_trim(prefix_buffer[prefix_end:])
+                    else:
+                        _LOGGER.warning(
+                            "Could not detect prefix silence; emitting buffered audio without prefix trim"
+                        )
+                        await emit_after_leading_trim(prefix_buffer)
 
-                # Find and remove the sacrificial prefix ("...") by detecting the pause after it
-                # This adapts to different voice speeds rather than using a fixed duration
-                silence_threshold = 0.01
-                max_amplitude = numpy.abs(full_audio).max()
-                threshold = max_amplitude * silence_threshold
-                
-                # Minimum time before we start looking for the pause (avoid false early detection)
-                min_prefix_samples = int(sample_rate * PREFIX_MIN_DURATION)
-                # Maximum time to search for the prefix end
-                max_prefix_samples = int(sample_rate * PREFIX_MAX_DURATION)
-                # Minimum silence duration to consider it the gap after "..."
-                min_silence_samples = int(sample_rate * PREFIX_SILENCE_GAP)
-                
-                # Find where the prefix ends by looking for a silence gap
-                prefix_end = 0
-                if len(full_audio) > min_prefix_samples:
-                    search_end = min(len(full_audio), max_prefix_samples)
-                    is_silent = numpy.abs(full_audio[:search_end]) < threshold
-                    
-                    # Look for a silence gap after the minimum prefix duration
-                    i = min_prefix_samples
-                    while i < search_end:
-                        if is_silent[i]:
-                            # Found start of silence, check if it's long enough
-                            silence_start = i
-                            while i < search_end and is_silent[i]:
-                                i += 1
-                            silence_length = i - silence_start
-                            if silence_length >= min_silence_samples:
-                                # Found the gap after the prefix - start after this silence
-                                prefix_end = i
-                                break
-                        else:
-                            i += 1
-                
-                if prefix_end > 0:
-                    _LOGGER.debug("Trimming prefix: %d samples (%.3fs)", 
-                                  prefix_end, prefix_end / sample_rate)
-                    full_audio = full_audio[prefix_end:]
-
-                # Trim any remaining leading silence
-                non_silent_indices = numpy.where(numpy.abs(full_audio) > threshold)[0]
-                if len(non_silent_indices) > 0:
-                    padding_samples = int(sample_rate * 0.05)  # 50ms padding
-                    first_non_silent = max(0, non_silent_indices[0] - padding_samples)
-                    full_audio = full_audio[first_non_silent:]
-                    
-                    # Trim trailing silence at the end
-                    non_silent_indices = numpy.where(numpy.abs(full_audio) > threshold)[0]
-                    if len(non_silent_indices) > 0:
-                        last_non_silent = non_silent_indices[-1] + padding_samples
-                        full_audio = full_audio[:last_non_silent + 1]
-
-                full_audio = (full_audio.clip(-1.0, 1.0) * 32767).astype("int16")
-                audio_bytes = full_audio.tobytes()
+                await flush_audio()
 
                 # Write debug WAV file if enabled
                 if self.cli_args.debug_wav:
                     try:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                         wav_filename = f"/output/debug_{voice_name}_{timestamp}.wav"
+                        debug_audio = (
+                            numpy.concatenate(debug_audio_arrays)
+                            if debug_audio_arrays
+                            else numpy.array([], dtype="float32")
+                        )
+                        debug_audio = (
+                            debug_audio.clip(-1.0, 1.0) * 32767
+                        ).astype("int16")
                         with wave.open(wav_filename, "wb") as wav_file:
                             wav_file.setnchannels(channels)
                             wav_file.setsampwidth(width)
                             wav_file.setframerate(sample_rate)
-                            wav_file.writeframes(audio_bytes)
+                            wav_file.writeframes(debug_audio.tobytes())
                         _LOGGER.info("Debug WAV file written: %s", wav_filename)
                     except Exception as e:
                         _LOGGER.warning("Failed to write debug WAV file: %s", e)
-
-                num_chunks = int(numpy.ceil(len(audio_bytes) / bytes_per_chunk))
-                for i in range(num_chunks):
-                    offset = i * bytes_per_chunk
-                    chunk = audio_bytes[offset : offset + bytes_per_chunk]
-                    await self.write_event(
-                        AudioChunk(
-                            audio=chunk,
-                            rate=sample_rate,
-                            width=width,
-                            channels=channels,
-                        ).event(),
-                    )
 
                 if send_stop:
                     await self.write_event(AudioStop().event())
