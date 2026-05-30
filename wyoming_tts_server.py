@@ -456,6 +456,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
         self, synthesize: Synthesize, send_start: bool = True, send_stop: bool = True
     ) -> bool:
         """Handle synthesis request."""
+        request_started_at = time.monotonic()
         _LOGGER.debug(synthesize)
 
         raw_text = synthesize.text
@@ -566,6 +567,26 @@ class PocketTTSEventHandler(AsyncEventHandler):
                 synthesis_started_at = time.monotonic()
                 first_audio_sent = False
 
+                async def write_audio_chunk(chunk: bytes) -> None:
+                    nonlocal first_audio_sent
+
+                    await self.write_event(
+                        AudioChunk(
+                            audio=chunk,
+                            rate=sample_rate,
+                            width=width,
+                            channels=channels,
+                        ).event(),
+                    )
+
+                    if not first_audio_sent:
+                        first_audio_sent = True
+                        _LOGGER.info(
+                            "First audio chunk sent after %d ms from request (%d ms from generation start)",
+                            int((time.monotonic() - request_started_at) * 1000),
+                            int((time.monotonic() - synthesis_started_at) * 1000),
+                        )
+
                 async def emit_audio(audio_array: numpy.ndarray) -> None:
                     nonlocal first_audio_sent, pending_bytes
 
@@ -589,20 +610,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
 
                     for offset in range(0, len(bytes_to_emit), bytes_per_chunk):
                         chunk = bytes_to_emit[offset : offset + bytes_per_chunk]
-                        if not first_audio_sent:
-                            first_audio_sent = True
-                            _LOGGER.info(
-                                "Starting audio stream after %d ms",
-                                int((time.monotonic() - synthesis_started_at) * 1000),
-                            )
-                        await self.write_event(
-                            AudioChunk(
-                                audio=chunk,
-                                rate=sample_rate,
-                                width=width,
-                                channels=channels,
-                            ).event(),
-                        )
+                        await write_audio_chunk(chunk)
 
                 async def flush_audio() -> None:
                     nonlocal pending_bytes
@@ -610,14 +618,7 @@ class PocketTTSEventHandler(AsyncEventHandler):
                     if not pending_bytes:
                         return
 
-                    await self.write_event(
-                        AudioChunk(
-                            audio=pending_bytes,
-                            rate=sample_rate,
-                            width=width,
-                            channels=channels,
-                        ).event(),
-                    )
+                    await write_audio_chunk(pending_bytes)
                     pending_bytes = b""
 
                 prefix_buffer = numpy.array([], dtype="float32")
