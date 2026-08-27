@@ -186,6 +186,6 @@ Prefix trimming is streaming-aware: the server buffers only the beginning of the
 - **🔄 Last Run**: 2026-01-20 00:30:58 UTC
 - **Last Upstream SHA**: 6f9dd250c24ee85cecc5587902a684f0d82b2a0d 
 ## 📅 Release Status
-- **⏳ Last Build On**: 2026-08-26 01:05:17 UTC
-- **🔄 Last Run**: 2026-08-26 01:05:17 UTC
-- **Last Upstream SHA**: dc806aad0665b03a8fbb5cea304d0a5cb2fcc266
+- **⏳ Last Build On**: 2026-08-27 07:07:51 UTC
+- **🔄 Last Run**: 2026-08-27 07:07:51 UTC
+- **Last Upstream SHA**: 8c98c9b53663454fc4282863c53b4b4e215aba50
