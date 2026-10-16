@@ -86,6 +86,7 @@ DEFAULT_VOICE = os.environ.get(
 )
 MODEL_CONFIG = os.environ.get("MODEL_CONFIG")
 MODEL_VARIANT = os.environ.get("MODEL_VARIANT")
+QUANTIZE = os.environ.get("QUANTIZE", "false").lower() in ("true", "1", "yes")
 DEBUG_WAV = os.environ.get("DEBUG_WAV", "").lower() in ("true", "1", "yes")
 VOICES_DIR = os.environ.get("VOICES_DIR", "/voices")
 
@@ -96,13 +97,14 @@ LANGUAGE_ALIASES = {
     "english": "english",
     "english_2026-01": "english_2026-01",
     "english_2026-04": "english_2026-04",
-    "fr": "french_24l",
-    "fr-fr": "french_24l",
-    "french": "french_24l",
+    "english_2026-09": "english_2026-09",
+    "fr": "french",
+    "fr-fr": "french",
+    "french": "french",
     "french_24l": "french_24l",
-    "de": "german_24l",
-    "de-de": "german_24l",
-    "german": "german_24l",
+    "de": "german",
+    "de-de": "german",
+    "german": "german",
     "german_24l": "german_24l",
     "pt": "portuguese",
     "pt-pt": "portuguese",
@@ -112,30 +114,42 @@ LANGUAGE_ALIASES = {
     "it-it": "italian",
     "italian": "italian",
     "italian_24l": "italian_24l",
-    "es": "spanish_24l",
-    "es-es": "spanish_24l",
-    "spanish": "spanish_24l",
+    "es": "spanish",
+    "es-es": "spanish",
+    "spanish": "spanish",
     "spanish_24l": "spanish_24l",
+    "nl": "dutch",
+    "nl-nl": "dutch",
+    "nl-be": "dutch",
+    "dutch": "dutch",
+    "dutch_24l": "dutch_24l",
 }
 
 LANGUAGE_CODES = {
     "english": "en",
     "english_2026-01": "en",
     "english_2026-04": "en",
+    "english_2026-09": "en",
+    "french": "fr",
     "french_24l": "fr",
+    "german": "de",
     "german_24l": "de",
     "portuguese": "pt",
     "italian": "it",
     "italian_24l": "it",
+    "spanish": "es",
     "spanish_24l": "es",
+    "dutch": "nl",
+    "dutch_24l": "nl",
 }
 
 VOICE_LANGUAGES = {
     "giovanni": "italian",
-    "lola": "spanish_24l",
-    "juergen": "german_24l",
+    "lola": "spanish",
+    "juergen": "german",
     "rafael": "portuguese",
-    "estelle": "french_24l",
+    "estelle": "french",
+    "daan": "dutch",
 }
 
 PREDEFINED_VOICES = dict(_ORIGINS_OF_PREDEFINED_VOICES)
@@ -202,12 +216,12 @@ def load_tts_model(language: str) -> TTSModel:
         config = MODEL_VARIANT
 
     if config:
-        return TTSModel.load_model(config=config)
+        return TTSModel.load_model(config=config, quantize=QUANTIZE)
 
     try:
-        return TTSModel.load_model(language=language)
+        return TTSModel.load_model(language=language, quantize=QUANTIZE)
     except TypeError:
-        return TTSModel.load_model(config=MODEL_VARIANT or language)
+        return TTSModel.load_model(config=MODEL_VARIANT or language, quantize=QUANTIZE)
 
 
 def scan_custom_voices(voices_dir: str | Path, default_language: str) -> None:

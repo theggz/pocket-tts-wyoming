@@ -1,7 +1,7 @@
 FROM ghcr.io/astral-sh/uv:debian
 WORKDIR /app
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 https://github.com/kyutai-labs/pocket-tts.git . && rm -rf .git
+RUN git clone --depth 1 --branch v3.3.0 https://github.com/kyutai-labs/pocket-tts.git . && rm -rf .git
 COPY wyoming_tts_server.py .
 
 # UV_TORCH_BACKEND has no effect on `uv add`/`uv lock`/`uv sync`/`uv run` —
@@ -20,6 +20,7 @@ ENV WYOMING_HOST=0.0.0.0
 ENV DEFAULT_LANGUAGE=english
 ENV DEFAULT_VOICE=alba
 ENV VOICES_DIR=/voices
+ENV QUANTIZE=false
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 10201

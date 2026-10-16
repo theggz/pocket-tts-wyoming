@@ -9,6 +9,7 @@ services:
       - DEFAULT_LANGUAGE=english
       - DEFAULT_VOICE=alba
       - VOICES_DIR=/voices
+      - QUANTIZE=${QUANTIZE:-false}
       - ZEROCONF=pocket-tts
     restart: unless-stopped
     volumes:

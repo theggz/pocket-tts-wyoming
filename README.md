@@ -40,11 +40,14 @@ You can customize the following environment variables in the compose file before
 |----------|---------|-------------|
 | `WYOMING_PORT` | `10201` | The port the Wyoming protocol server listens on. Change if you have a conflict with another service. |
 | `WYOMING_HOST` | `0.0.0.0` | The network interface to bind to. `0.0.0.0` accepts connections from any interface. |
-| `DEFAULT_LANGUAGE` | `english` | The default Pocket-TTS language/model to use when no voice language is specified. Use `french_24l` for French. |
+| `DEFAULT_LANGUAGE` | `english` | The default Pocket-TTS language/model to use when no voice language is specified. Use `french` for French; `french_24l` selects the larger model. |
 | `DEFAULT_VOICE` | `alba` | The default voice used when none is specified. See [Available Voices](#available-voices) for options. |
+| `QUANTIZE` | `false` | Enable Pocket-TTS dynamic int8 quantization for CPU inference. Set to `true` to test lower memory use and faster synthesis. |
 | `MODEL_CONFIG` | unset | Optional local Pocket-TTS YAML config. Most users should leave this unset and use `DEFAULT_LANGUAGE`. |
 | `VOICES_DIR` | `/voices` | Directory scanned for custom `.safetensors` voice states. |
 | `ZEROCONF` | `pocket-tts` | Service name for mDNS/Zeroconf discovery. Home Assistant uses this to auto-discover the TTS server. Set to empty string to disable. |
+
+Set `QUANTIZE=true` in a `.env` file beside `docker-compose.yml` to enable int8 quantization. It is disabled by default.
 
 Pull and start:
 
@@ -90,6 +93,7 @@ docker build -t pocket-tts-wyoming .
 ```
 
 Then update `docker-compose.yml` to use `build: .` instead of `image: ghcr.io/ikidd/pocket-tts-wyoming:latest`.
+The Dockerfile pins the upstream Pocket-TTS source to v3.3.0 for reproducible builds.
 
 
 ## Available Voices
@@ -106,7 +110,9 @@ Portuguese: rafael
 
 Spanish: lola
 
-Pocket-TTS v2 loads one language model at a time. The server loads language models lazily based on the requested voice, so the first synthesis in a non-default language can take longer while the model is downloaded and initialized.
+Dutch: daan
+
+The server uses Pocket-TTS v3.3.0 and loads language models lazily based on the requested voice. The first synthesis in a non-default language can take longer while the model is downloaded and initialized. French uses the faster `french` model by default; select `french_24l` explicitly for the larger model.
 
 ## Custom Voices
 
@@ -116,7 +122,7 @@ the `voices` directory mounted as `/voices` in the container. A file named
 
 Custom voices use `DEFAULT_LANGUAGE` by default. To assign a custom voice to a
 specific Pocket-TTS language/model, place it in a language subdirectory, for
-example `voices/french_24l/ma_voix.safetensors`.
+example `voices/french/ma_voix.safetensors`. Use `voices/french_24l/` to select the larger French model instead.
 
 The server scans the voices directory when Home Assistant asks for Wyoming info
 and before each synthesis request. If Home Assistant has already cached the
