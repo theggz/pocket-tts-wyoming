@@ -1,6 +1,6 @@
 services:
   pocket-tts-wyoming:
-    image: ghcr.io/ikidd/pocket-tts-wyoming:latest
+    image: ghcr.io/theggz/pocket-tts-wyoming:latest
     container_name: pocket-tts-wyoming
     network_mode: host
     environment:
